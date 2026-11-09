@@ -74,8 +74,10 @@ lsmod
 rmmod hello2                  # не вдається: модуль "зайнятий"
 rmmod hello1                  # теж не вдається: його використовує hello2
 cat /sys/module/hello2/sections/.init.text
-cat /sys/module/hello2/sections/.text
 ```
+
+Секції `.text` у `hello2` немає: модуль містить лише `__init`- і `__exit`-функції
+(секції `.init.text` і `.exit.text`).
 
 ### Експеримент 2 — «kmalloc() повернув 0»
 
@@ -92,38 +94,40 @@ lsmod
 
 ## Пошук місця аварії (на хост-машині)
 
-В oops є рядок `PC is at <функція>+<зміщення>/<розмір> [<модуль>]` та значення
-регістра `pc : [<адреса>]`.
+Отримані oops (QEMU, ядро 7.3.0-rc6):
 
-**Спосіб 1 — за символом і зміщенням** (зручно для обох oops):
+| oops | рядок `PC is at` | `pc` | адреса секції в sysfs |
+|------|------------------|------|-----------------------|
+| `BUG_ON()` | `hello2_init+0x18/0xf80 [hello2]` | `0xbf00c098` | `.init.text` = `0xbf00c080` |
+| NULL pointer | `print_hello+0x60/0x140 [hello1]` | `0xbf000060` | `.text` = `0xbf000000` |
 
-```bash
-gdb-multiarch -q hello1.ko.unstripped
-(gdb) list *(print_hello+0x40)       # зміщення з рядка "PC is at"
-(gdb) info line *(print_hello+0x40)
-(gdb) disassemble /s print_hello
+Команди gdb передаються через `-ex` у режимі `-batch` (вставлені в інтерактивний gdb
+одним блоком, вони читаються як один рядок).
 
-gdb-multiarch -q hello2.ko.unstripped
-(gdb) list *(hello2_init+0x10)
-```
-
-**Спосіб 2 — за абсолютною адресою з oops та адресами секцій із sysfs**
-(`/sys/module/<модуль>/sections/`, імена файлів починаються з крапки):
+**Спосіб 1 — функція + зміщення з рядка `PC is at`:**
 
 ```bash
-gdb-multiarch -q
-(gdb) add-symbol-file hello1.ko.unstripped 0xbf000000          # = /sys/module/hello1/sections/.text
-(gdb) list *0xbf000040                                          # = pc з oops
-# для hello2_init (секція .init.text):
-(gdb) add-symbol-file hello2.ko.unstripped -s .text 0xbf006000 -s .init.text 0xbf00a000
-(gdb) list *0xbf00a010
+gdb-multiarch -q -batch -ex 'list *(print_hello+0x60)' \
+    -ex 'info line *(print_hello+0x60)' hello1.ko.unstripped
+gdb-multiarch -q -batch -ex 'list *(hello2_init+0x18)' hello2.ko.unstripped
 ```
 
-**Спосіб 3 — objdump**: `make dis`, у `hello1.dis` знайти `<print_hello>:` і
-додати зміщення з oops до адреси функції; поруч буде рядок коду C.
+**Спосіб 2 — абсолютна адреса `pc` + адреса секції з `/sys/module/<модуль>/sections/`**
+(основний файл не передається, інакше gdb бере таблицю рядків із копії без зміщення):
 
 ```bash
-arm-linux-gnueabihf-objdump -dS hello1.ko.unstripped | less
+gdb-multiarch -q -batch -ex 'add-symbol-file hello1.ko.unstripped 0xbf000000' \
+    -ex 'list *0xbf000060' -ex 'info line *0xbf000060'
+# hello2_init — у секції .init.text
+gdb-multiarch -q -batch -ex 'add-symbol-file hello2.ko.unstripped -s .init.text 0xbf00c080' \
+    -ex 'list *0xbf00c098' -ex 'info line *0xbf00c098'
 ```
 
-Адреси вище — приклади, підставте значення зі свого виводу.
+**Спосіб 3 — objdump** (`make dis` або напряму):
+
+```bash
+arm-linux-gnueabihf-objdump -dS --disassemble=print_hello hello1.ko.unstripped | grep -B12 -A3 " 60:"
+```
+
+Результат: NULL pointer — `hello1.c:52` (`ev->start = ktime_get();`, інструкція
+`strd r2, r3, [r4, #8]`, r4 = NULL); `BUG_ON()` — `hello2.c:37` (інструкція `udf`, `e7f001f2`).
